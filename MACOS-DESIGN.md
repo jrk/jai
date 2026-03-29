@@ -278,3 +278,30 @@ A reasonable split would be:
 Strict mode should probably collapse into bare mode on macOS and rely
 on Seatbelt's `deny file-read*` rules for confidentiality, sidestepping
 the ID‑mapped‑mount gap entirely.
+
+## Appendix: plumbing substitutions
+
+Beyond the big architectural pieces, a handful of smaller Linux‑isms
+in the current source need Darwin equivalents:
+
+| Linux                                  | macOS                                             |
+| -------------------------------------- | ------------------------------------------------- |
+| `signalfd` + `poll`                    | `kqueue` + `EVFILT_SIGNAL`                        |
+| `prctl(PR_SET_PDEATHSIG)`              | `kqueue` + `EVFILT_PROC`/`NOTE_EXIT` on parent pid |
+| `O_TMPFILE` + `linkat(AT_EMPTY_PATH)`  | `mkstemp` + `rename`                              |
+| `readlink("/proc/self/fd/N")`          | `fcntl(fd, F_GETPATH)`                            |
+| parse `/proc/self/mountinfo`           | `getfsstat(2)` / `getmntinfo(3)`                  |
+| `statx(STATX_ATTR_MOUNT_ROOT)`         | compare `st_dev` of path vs. parent               |
+| `clone3` with namespace flags          | plain `fork` (no namespaces to create)            |
+| `pipe2(O_CLOEXEC)`                     | `pipe` + `fcntl(FD_CLOEXEC)`                      |
+| POSIX ACLs via `acl_set_file`          | same API, different text format (`chmod +a`)      |
+
+The pid‑1 / `parent_loop` dance (jai.cc:783‑950) exists solely to work
+around PID‑namespace signal semantics.  With no PID namespace on
+macOS, all of that collapses to a straight `fork`/`waitpid` and the
+shell's ordinary job control just works.
+
+Also worth noting: Linux jai does **not** isolate the network
+(`CLONE_NEWNET` is never set), so the absence of network namespaces on
+macOS is not a regression.  A Seatbelt backend could optionally go
+further with `(deny network*)` as an opt‑in tightening.
