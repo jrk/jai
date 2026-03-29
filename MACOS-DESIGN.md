@@ -48,9 +48,16 @@ security machinery.  The short version:
   * There is **no mount namespace** abstraction.  The mount table is
     global.  `chroot` exists but is a blunt instrument, requires root,
     and is defeated by the system volume being read‑only and
-    firmlinked.
-  * There is **no overlayfs**.  `mount_union` existed historically but
-    has been disabled since 10.6.  APFS has per‑file copy‑on‑write
+    firmlinked.  Apple's own container runtime (`apple/container`,
+    WWDC 2025) boots a full Linux micro‑VM per container rather than
+    trying to namespace XNU — a strong signal that the kernel simply
+    doesn't have the primitives.
+  * There is **no overlayfs**.  XNU exposes an `MNT_UNION` mount flag,
+    but it has no copy‑up or whiteout semantics — writes don't
+    propagate through, so it's useless for a CoW `$HOME`.  A
+    `mount_nullfs` binary ships with the OS but is gated behind both
+    SIP and AMFI, making it unusable without crippling the machine's
+    security posture.  APFS has per‑file copy‑on‑write
     (`clonefile(2)`) and volume‑level snapshots, but nothing that lets
     you overlay one directory on another at mount time.
   * There are **no user namespaces** and no ID‑mapped mounts.
@@ -69,16 +76,25 @@ reproduce the *policy* with different primitives?
 1. **Seatbelt / `sandbox-exec` / `sandbox_init(3)`** — a kernel‑level
    MAC framework driven by a small Scheme‑flavoured policy language
    (SBPL).  Every App Store app runs under it; the `sandbox-exec`
-   CLI is "deprecated" but still ships and still works.  Policies can
-   `allow`/`deny` any of several dozen operation classes, most
-   importantly `file-read*` and `file-write*`, filtered by `literal`,
-   `subpath`, or `regex` path patterns.  Enforcement happens in the
-   kernel and is inherited across `exec`.
+   CLI is "deprecated" but still ships, still works, and is what
+   Chrome's renderer and other AI‑CLI sandboxes use in production
+   today.  Policies can `allow`/`deny` any of several dozen operation
+   classes, most importantly `file-read*` and `file-write*`, filtered
+   by `literal`, `subpath`, or `regex` path patterns.  Enforcement
+   happens in the kernel, is irreversible once applied, and is
+   inherited across `exec`.  Denials are observable with
+   `log stream --predicate 'sender=="Sandbox"'`, and adding
+   `(trace "/tmp/trace.sb")` to a profile dumps the minimal rule set
+   a given workload needs — invaluable for iterating on a default
+   profile.
 
 2. **APFS `clonefile(2)` / `copyfile(..., COPYFILE_CLONE)`** —
    constant‑time, space‑sharing copies of files or directory trees.
    A clone of `$HOME` costs essentially nothing until you write to
-   it.
+   it.  Two caveats: clones only work *within* a single APFS volume
+   (not even across volumes in the same container), and the
+   fd‑based `fcopyfile()` silently falls back to a full copy — the
+   path‑based `clonefile()` or `copyfile()` must be used.
 
 3. **`/etc/synthetic.conf` + APFS volumes** — lets you create
    root‑level synthetic mount points and separate writable volumes.
@@ -305,3 +321,38 @@ Also worth noting: Linux jai does **not** isolate the network
 (`CLONE_NEWNET` is never set), so the absence of network namespaces on
 macOS is not a regression.  A Seatbelt backend could optionally go
 further with `(deny network*)` as an opt‑in tightening.
+
+## Appendix: privilege and entitlement requirements
+
+| Primitive                       | Needs root | Needs SIP off | Needs Apple entitlement       |
+| ------------------------------- | ---------- | ------------- | ----------------------------- |
+| `sandbox_init` / SBPL           | no         | no            | no                            |
+| `clonefile`                     | no         | no            | no                            |
+| APFS volume add/delete          | yes        | no            | no                            |
+| APFS snapshot create            | yes        | no            | yes (DTS‑granted)             |
+| `chroot`                        | yes        | effectively   | no                            |
+| native `mount_nullfs`           | yes        | yes (+ AMFI)  | no                            |
+| `MNT_UNION`                     | yes        | no            | no                            |
+| Virtualization.framework        | no         | no            | yes (self‑signable)           |
+| Endpoint Security               | no         | no¹           | yes (Apple‑granted)           |
+| macFUSE / fuse‑t                | no         | no            | no (user approval for kext)   |
+
+¹ Development without the entitlement requires SIP disabled.
+
+The recommended Seatbelt+clonefile design sits entirely in the top two
+rows — no root, no SIP changes, no entitlements — which is why it's
+the right default.
+
+## References
+
+  * Chromium sandbox design:
+    `chromium.googlesource.com/chromium/src/+/HEAD/sandbox/mac/seatbelt_sandbox_design.md`
+  * Apple Sandbox Guide (reverse‑engineered SBPL reference):
+    `reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf`
+  * `apple/container` and `apple/containerization` on GitHub —
+    Apple's own VM‑per‑container runtime, useful as a reference for
+    the Virtualization.framework approach.
+  * `darwin-xnu/bsd/sys/mount.h` — `MNT_UNION`, `MNT_NOSUID` flag
+    definitions.
+  * Endpoint Security:
+    `developer.apple.com/documentation/endpointsecurity`
