@@ -164,10 +164,50 @@ What you lose relative to Linux jai:
     they really live.  `$HOME` is a different path, not a mount over
     the original.  This is usually fine (AI CLIs respect `$HOME`) but
     software that hard‑codes `/Users/<name>` will notice.
-  * `clonefile` of a large `$HOME` with millions of inodes is still
-    O(inodes) in directory‑entry creation, whereas overlayfs is O(1).
-    Partial mitigation: clone only the dot‑dirs the agent actually
-    needs, or make casual mode opt‑in per subtree.
+  * `clonefile` of a large `$HOME` is **O(inodes)**, not O(1).  APFS
+    shares data blocks instantly, but still has to create a new
+    directory entry and inode for every file in the tree.  A `$HOME`
+    with half a million files (`node_modules`, `~/.cache`,
+    `~/Library/Caches`, …) takes seconds to clone, versus overlayfs's
+    single‑syscall mount.  Mitigations:
+
+      - Persist the clone between runs, as Linux jai already does with
+        its overlays under `/run/jai`.  First invocation pays; later
+        ones are instant.
+      - Clone selectively.  Most agents only touch `~/.config`,
+        `~/.local`, `~/.cache`, and their own dotdir.  Cloning just
+        those (and deny‑reading the rest) is faster *and* improves on
+        Linux casual mode's everything‑is‑readable confidentiality.
+      - Default to bare mode on macOS and make the full‑home clone an
+        explicit opt‑in.
+
+  * There is no built‑in "what changed?" view.  On Linux the
+    overlayfs `upperdir` *is* the diff; on macOS a clone has no such
+    marker.  Options:
+
+      - **FSEvents** — open an `FSEventStreamCreate()` watch on the
+        clone before exec; the accumulated event log at exit is the
+        precise change list.  Native, no entitlements, no polling.
+      - **mtime sweep** — record the clone timestamp, then at exit
+        walk for files newer than that.  Cheap and usually
+        sufficient; misses metadata‑only changes.
+      - APFS snapshot diff would be ideal but requires an
+        Apple‑granted entitlement.
+
+    A `jai --diff` subcommand should wrap one of the first two.
+
+  * **Granted directories appear twice.**  If `$PWD` lives under
+    `$HOME`, cloning `$HOME` produces a stale copy at
+    `$CLONE/project` alongside the real `/Users/alice/project`.  An
+    agent that navigates via `$HOME/project` ends up in the clone and
+    its writes go nowhere useful.  Linux jai avoids this because the
+    bind mount makes both paths resolve to the same inode.
+
+    Fix: after cloning, replace every granted subtree inside the
+    clone with a symlink to its real path
+    (`$CLONE/project → /Users/alice/project`), so both routes
+    converge on the live directory.  Skipping granted subtrees during
+    the clone and symlinking afterward also shaves clone time.
   * No ID‑mapped mounts, so strict mode cannot transparently give the
     jailed UID write access to the user's files.  The grant
     directories would need a `chmod`/ACL pass or simply run in bare
@@ -192,10 +232,15 @@ std::string profile = R"((version 1)
 (allow file-read* (subpath "/"))
 (deny  file-write* (subpath "/"))
 )";
-for (auto &g : grants)
-    profile += std::format("(allow file* (subpath \"{}\"))\n", g);
 profile += std::format("(deny file* (subpath \"{}\"))\n", real_home);
 profile += std::format("(allow file* (subpath \"{}\"))\n", jail_home);
+for (auto &g : grants) {
+    profile += std::format("(allow file* (subpath \"{}\"))\n", g);
+    // Inside the clone, replace the granted subtree with a symlink
+    // to the real path so $HOME/project and /Users/.../project
+    // converge on the same directory.
+    replace_with_symlink(jail_home / relative(g, real_home), g);
+}
 
 char *err;
 sandbox_init_with_parameters(profile.c_str(),
